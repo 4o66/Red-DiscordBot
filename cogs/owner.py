@@ -2,7 +2,8 @@ import discord
 from discord.ext import commands
 from cogs.utils import checks
 from __main__ import set_cog, send_cmd_help, settings
-from .utils.dataIO import fileIO
+from .utils.dataIO import dataIO
+from .utils.chat_formatting import pagify, box
 
 import importlib
 import traceback
@@ -45,7 +46,8 @@ class Owner:
     def __init__(self, bot):
         self.bot = bot
         self.setowner_lock = False
-        self.disabled_commands = fileIO("data/red/disabled_commands.json", "load")
+        self.file_path = "data/red/disabled_commands.json"
+        self.disabled_commands = dataIO.load_json(self.file_path)
         self.session = aiohttp.ClientSession(loop=self.bot.loop)
 
     def __unload(self):
@@ -170,7 +172,6 @@ class Owner:
 
         Modified function, originally made by Rapptz"""
         code = code.strip('` ')
-        python = '```py\n{}\n```'
         result = None
 
         global_vars = globals().copy()
@@ -184,13 +185,15 @@ class Owner:
         try:
             result = eval(code, global_vars, locals())
         except Exception as e:
-            await self.bot.say(python.format(type(e).__name__ + ': ' + str(e)))
+            await self.bot.say(box('{}: {}'.format(type(e).__name__, str(e)),
+                                   lang="py"))
             return
 
         if asyncio.iscoroutine(result):
             result = await result
 
-        result = python.format(result)
+        result = str(result)
+
         if not ctx.message.channel.is_private:
             censor = (settings.email, settings.password)
             r = "[EXPUNGED]"
@@ -199,7 +202,8 @@ class Owner:
                     result = result.replace(w, r)
                     result = result.replace(w.lower(), r)
                     result = result.replace(w.upper(), r)
-        await self.bot.say(result)
+        for page in pagify(result, shorten_by=12):
+            await self.bot.say(box(page, lang="py"))
 
     @commands.group(name="set", pass_context=True)
     async def _set(self, ctx):
@@ -211,13 +215,17 @@ class Owner:
     @_set.command(pass_context=True)
     async def owner(self, ctx):
         """Sets owner"""
-        if settings.owner != "id_here":
-            await self.bot.say("Owner ID has already been set.")
-            return
-
         if self.setowner_lock:
             await self.bot.say("A set owner command is already pending.")
             return
+
+        if settings.owner != "id_here":
+            await self.bot.say(
+            "The owner is already set. Remember that setting the owner "
+            "to someone else other than who hosts the bot has security "
+            "repercussions and is *NOT recommended*. Proceed at your own risk."
+            )
+            await asyncio.sleep(3)
 
         await self.bot.say("Confirm in the console that you're the owner.")
         self.setowner_lock = True
@@ -282,18 +290,84 @@ class Owner:
 
     @_set.command(pass_context=True)
     @checks.is_owner()
-    async def status(self, ctx, *, status=None):
-        """Sets Red's status
+    async def game(self, ctx, *, game=None):
+        """Sets Red's playing status
 
         Leaving this empty will clear it."""
 
-        if status:
-            status = status.strip()
-            await self.bot.change_status(discord.Game(name=status))
-            log.debug('Status set to "{}" by owner'.format(status))
+        server = ctx.message.server
+
+        current_status = server.me.status if server is not None else None
+
+        if game:
+            game = game.strip()
+            await self.bot.change_presence(game=discord.Game(name=game),
+                                           status=current_status)
+            log.debug('Status set to "{}" by owner'.format(game))
         else:
-            await self.bot.change_status(None)
+            await self.bot.change_presence(game=None, status=current_status)
             log.debug('status cleared by owner')
+        await self.bot.say("Done.")
+
+    @_set.command(pass_context=True)
+    @checks.is_owner()
+    async def status(self, ctx, *, status=None):
+        """Sets Red's status
+
+        Statuses:
+            online
+            idle
+            dnd
+            invisible"""
+
+        statuses = {
+                    "online"    : discord.Status.online,
+                    "idle"      : discord.Status.idle,
+                    "dnd"       : discord.Status.dnd,
+                    "invisible" : discord.Status.invisible
+                   }
+
+        server = ctx.message.server
+
+        current_game = server.me.game if server is not None else None
+
+        if status is None:
+            await self.bot.change_presence(status=discord.Status.online,
+                                           game=current_game)
+            await self.bot.say("Status reset.")
+        else:
+            status = statuses.get(status.lower(), None)
+            if status:
+                await self.bot.change_presence(status=status,
+                                               game=current_game)
+                await self.bot.say("Status changed.")
+            else:
+                await send_cmd_help(ctx)
+
+    @_set.command(pass_context=True)
+    @checks.is_owner()
+    async def stream(self, ctx, streamer=None, *, stream_title=None):
+        """Sets Red's streaming status
+
+        Leaving both streamer and stream_title empty will clear it."""
+
+        server = ctx.message.server
+
+        current_status = server.me.status if server is not None else None
+
+        if stream_title:
+            stream_title = stream_title.strip()
+            if "twitch.tv/" not in streamer:
+                streamer = "https://www.twitch.tv/" + streamer
+            game = discord.Game(type=1, url=streamer, name=stream_title)
+            await self.bot.change_presence(game=game, status=current_status)
+            log.debug('Owner has set streaming status and url to "{}" and {}'.format(stream_title, streamer))
+        elif streamer is not None:
+            await send_cmd_help(ctx)
+            return
+        else:
+            await self.bot.change_presence(game=None, status=current_status)
+            log.debug('stream cleared by owner')
         await self.bot.say("Done.")
 
     @_set.command()
@@ -358,7 +432,7 @@ class Owner:
             comm_obj.enabled = False
             comm_obj.hidden = True
             self.disabled_commands.append(command)
-            fileIO("data/red/disabled_commands.json", "save", self.disabled_commands)
+            dataIO.save_json(self.file_path, self.disabled_commands)
             await self.bot.say("Command has been disabled.")
 
     @command_disabler.command()
@@ -366,7 +440,7 @@ class Owner:
         """Enables commands/subcommands"""
         if command in self.disabled_commands:
             self.disabled_commands.remove(command)
-            fileIO("data/red/disabled_commands.json", "save", self.disabled_commands)
+            dataIO.save_json(self.file_path, self.disabled_commands)
             await self.bot.say("Command enabled.")
         else:
             await self.bot.say("That command is not disabled.")
@@ -389,7 +463,7 @@ class Owner:
         except KeyError:
             return KeyError
         for check in comm_obj.checks:
-            if check.__name__ == "is_owner_check":
+            if hasattr(check, "__name__") and check.__name__ == "is_owner_check":
                 return False
         return comm_obj
 
@@ -455,24 +529,39 @@ class Owner:
     async def servers(self, ctx):
         """Lists and allows to leave servers"""
         owner = ctx.message.author
-        servers = list(self.bot.servers)
-        server_list = {}
+        servers = sorted(list(self.bot.servers),
+                         key=lambda s: s.name.lower())
         msg = ""
-        for i in range(0, len(servers)):
-            server_list[str(i)] = servers[i]
-            msg += "{}: {}\n".format(str(i), servers[i].name)
+        for i, server in enumerate(servers):
+            msg += "{}: {}\n".format(i, server.name)
         msg += "\nTo leave a server just type its number."
-        await self.bot.say(msg)
-        while msg != None:
+
+        for page in pagify(msg, ['\n']):
+            await self.bot.say(page)
+
+        while msg is not None:
             msg = await self.bot.wait_for_message(author=owner, timeout=15)
-            if msg != None:
-                msg = msg.content.strip()
-                if msg in server_list.keys():
-                    await self.leave_confirmation(server_list[msg], owner, ctx)
-                else:
-                    break
-            else:
+            try:
+                msg = int(msg.content)
+                await self.leave_confirmation(servers[msg], owner, ctx)
                 break
+            except (IndexError, ValueError, AttributeError):
+                pass
+
+    async def leave_confirmation(self, server, owner, ctx):
+        await self.bot.say("Are you sure you want me "
+                    "to leave {}? (yes/no)".format(server.name))
+
+        msg = await self.bot.wait_for_message(author=owner, timeout=15)
+
+        if msg is None:
+            await self.bot.say("I guess not.")
+        elif msg.content.lower().strip() in ("yes", "y"):
+            await self.bot.leave_server(server)
+            if server != ctx.message.server:
+                await self.bot.say("Done.")
+        else:
+            await self.bot.say("Alright then.")
 
     @commands.command(pass_context=True)
     async def contact(self, ctx, *, message : str):
@@ -504,43 +593,68 @@ class Owner:
     @commands.command()
     async def info(self):
         """Shows info about Red"""
-        await self.bot.say(
-        "This is an instance of Red, an open source Discord bot created by "
-        "Twentysix and improved by many.\n\n**Github:**\n"
-        "<https://github.com/Twentysix26/Red-DiscordBot/>\n"
-        "**Official server:**\n<https://discord.me/Red-DiscordBot>")
+        author_repo = "https://github.com/Twentysix26"
+        red_repo = author_repo + "/Red-DiscordBot"
+        server_url = "https://discord.me/Red-DiscordBot"
+        dpy_repo = "https://github.com/Rapptz/discord.py"
+        python_url = "https://www.python.org/"
+        since = datetime.datetime(2016, 1, 2, 0, 0)
+        days_since = (datetime.datetime.now() - since).days
+        dpy_version = "[{}]({})".format(discord.__version__, dpy_repo)
+        py_version = "[{}.{}.{}]({})".format(*os.sys.version_info[:3],
+                                             python_url)
 
-    async def leave_confirmation(self, server, owner, ctx):
-        if not ctx.message.channel.is_private:
-            current_server = ctx.message.server
-        else:
-            current_server = None
-        answers = ("yes", "y")
-        await self.bot.say("Are you sure you want me "
-                    "to leave {}? (yes/no)".format(server.name))
-        msg = await self.bot.wait_for_message(author=owner, timeout=15)
-        if msg is None:
-            await self.bot.say("I guess not.")
-        elif msg.content.lower().strip() in answers:
-            await self.bot.leave_server(server)
-            if server != current_server:
-                await self.bot.say("Done.")
-        else:
-            await self.bot.say("Alright then.")
+        owner = settings.owner if settings.owner != "id_here" else None
+        if owner:
+            owner = discord.utils.get(self.bot.get_all_members(), id=owner)
+            if not owner:
+                try:
+                    owner = await self.bot.get_user_info(settings.owner)
+                except:
+                    owner = None
+        if not owner:
+            owner = "Unknown"
+
+        about = (
+            "This is an instance of [Red, an open source Discord bot]({}) "
+            "created by [Twentysix]({}) and improved by many.\n\n"
+            "Red is backed by a passionate community who contributes and "
+            "creates content for everyone to enjoy. [Join us today]({}) "
+            "and help us improve!\n\n"
+            "".format(red_repo, author_repo, server_url))
+
+        embed = discord.Embed(colour=discord.Colour.red())
+        embed.add_field(name="Instance owned by", value=str(owner))
+        embed.add_field(name="Python", value=py_version)
+        embed.add_field(name="discord.py", value=dpy_version)
+        embed.add_field(name="About Red", value=about, inline=False)
+        embed.set_footer(text="Bringing joy since 02 Jan 2016 (over "
+                         "{} days ago!)".format(days_since))
+
+        try:
+            await self.bot.say(embed=embed)
+        except discord.HTTPException:
+            await self.bot.say("I need the `Embed links` permission "
+                               "to send this")
 
     @commands.command()
     async def uptime(self):
         """Shows Red's uptime"""
-        up = abs(self.bot.uptime - int(time.perf_counter()))
-        up = str(datetime.timedelta(seconds=up))
-        await self.bot.say("`Uptime: {}`".format(up))
+        now = datetime.datetime.now()
+        uptime = (now - self.bot.uptime).seconds
+        uptime = datetime.timedelta(seconds=uptime)
+        await self.bot.say("`Uptime: {}`".format(uptime))
 
     @commands.command()
     async def version(self):
         """Shows Red's current version"""
         response = self.bot.loop.run_in_executor(None, self._get_version)
         result = await asyncio.wait_for(response, timeout=10)
-        await self.bot.say(result)
+        try:
+            await self.bot.say(embed=result)
+        except discord.HTTPException:
+            await self.bot.say("I need the `Embed links` permission "
+                               "to send this")
 
     def _load_cog(self, cogname):
         if not self._does_cogfile_exist(cogname):
@@ -564,12 +678,8 @@ class Owner:
             raise CogUnloadError
 
     def _list_cogs(self):
-        cogs = glob.glob("cogs/*.py")
-        clean = []
-        for c in cogs:
-            c = c.replace("/", "\\")  # Linux fix
-            clean.append("cogs." + c.split("\\")[1].replace(".py", ""))
-        return clean
+        cogs = [os.path.basename(f) for f in glob.glob("cogs/*.py")]
+        return ["cogs." + os.path.splitext(f)[0] for f in cogs]
 
     def _does_cogfile_exist(self, module):
         if "cogs." not in module:
@@ -582,7 +692,8 @@ class Owner:
         print(author.name + " requested to be set as owner. If this is you, "
               "type 'yes'. Otherwise press enter.")
         print()
-        print("*DO NOT* set anyone else as owner.")
+        print("*DO NOT* set anyone else as owner. This has security "
+              "repercussions.")
 
         choice = "None"
         while choice.lower() != "yes" and choice == "None":
@@ -594,20 +705,37 @@ class Owner:
             self.setowner_lock = False
             self.owner.hidden = True
         else:
-            print("setowner request has been ignored.")
+            print("The set owner request has been ignored.")
             self.setowner_lock = False
 
     def _get_version(self):
-        getversion = os.popen(r'git show -s HEAD --format="%cr|%s|%h"')
-        getversion = getversion.read()
-        version = getversion.split('|')
-        return 'Last updated: ``{}``\nCommit: ``{}``\nHash: ``{}``'.format(
-            *version)
+        url = os.popen(r'git config --get remote.origin.url')
+        url = url.read().strip()[:-4]
+        repo_name = url.split("/")[-1]
+        commits = os.popen(r'git show -s -n 3 HEAD --format="%cr|%s|%H"')
+        ncommits = os.popen(r'git rev-list --count HEAD').read()
+
+        lines = commits.read().split('\n')
+        embed = discord.Embed(title="Updates of " + repo_name,
+                              description="Last three updates",
+                              colour=discord.Colour.red(),
+                              url=url)
+        for line in lines:
+            if not line:
+                continue
+            when, commit, chash = line.split("|")
+            commit_url = url + "/commit/" + chash
+            content = "[{}]({}) - {} ".format(chash[:6], commit_url, commit)
+            embed.add_field(name=when, value=content, inline=False)
+        embed.set_footer(text="Total commits: " + ncommits)
+
+        return embed
 
 def check_files():
     if not os.path.isfile("data/red/disabled_commands.json"):
         print("Creating empty disabled_commands.json...")
-        fileIO("data/red/disabled_commands.json", "save", [])
+        dataIO.save_json("data/red/disabled_commands.json", [])
+
 
 def setup(bot):
     check_files()
